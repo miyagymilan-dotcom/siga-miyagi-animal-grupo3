@@ -1,10 +1,8 @@
-from datetime import date
 import sqlite3
+from datetime import date
 import pandas as pd
 import streamlit as st
 
-
-# Configuración general de la página de Streamlit
 st.set_page_config(
     page_title="SIGA · MIYAGI ANIMALs",
     page_icon="🐾",
@@ -13,30 +11,30 @@ st.set_page_config(
 
 
 @st.cache_resource
-def obtener_conexion():
-    """Crea y reutiliza la conexión SQLite de forma segura para Streamlit."""
-    conexion = sqlite3.connect("mi_sistema.db", check_same_thread=False)
-    conexion.execute("PRAGMA foreign_keys = ON")
-    return conexion
+def get_connection():
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    inicializar_bd(conn)
+    return conn
 
 
-def inicializar_base_datos(conexion):
-    """Crea tablas, datos iniciales y vista solo si aún no existen."""
-    cursor = conexion.cursor()
-
-    # Crear tablas principales si no existen
+def inicializar_bd(conn):
+    cursor = conn.cursor()
     cursor.executescript(
         """
         CREATE TABLE IF NOT EXISTS proveedores (
             id_proveedor INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
-            telefono TEXT
+            telefono TEXT,
+            ciudad TEXT
         );
 
         CREATE TABLE IF NOT EXISTS clientes (
             id_cliente INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL,
-            telefono TEXT
+            telefono TEXT,
+            ciudad TEXT
         );
 
         CREATE TABLE IF NOT EXISTS productos (
@@ -44,110 +42,35 @@ def inicializar_base_datos(conexion):
             nombre TEXT NOT NULL,
             categoria TEXT NOT NULL,
             unidad_medida TEXT NOT NULL,
-            precio_unitario REAL NOT NULL,
-            stock_minimo INTEGER NOT NULL DEFAULT 0,
+            precio_unitario REAL NOT NULL CHECK (precio_unitario >= 0),
+            stock_minimo INTEGER NOT NULL CHECK (stock_minimo >= 0),
             fecha_vencimiento TEXT
         );
 
         CREATE TABLE IF NOT EXISTS movimientos (
             id_movimiento INTEGER PRIMARY KEY AUTOINCREMENT,
             id_producto INTEGER NOT NULL,
+            id_proveedor INTEGER,
+            id_cliente INTEGER,
             tipo TEXT NOT NULL CHECK (tipo IN ('entrada', 'salida')),
             cantidad INTEGER NOT NULL CHECK (cantidad > 0),
             fecha TEXT NOT NULL,
-            id_proveedor INTEGER,
-            id_cliente INTEGER,
-
+            observacion TEXT,
             FOREIGN KEY (id_producto) REFERENCES productos(id_producto),
             FOREIGN KEY (id_proveedor) REFERENCES proveedores(id_proveedor),
             FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente)
         );
-        """
-    )
 
-    # Insertar proveedores iniciales solo si la tabla está vacía
-    cursor.execute("SELECT COUNT(*) FROM proveedores")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany(
-            "INSERT INTO proveedores (nombre, telefono) VALUES (?, ?)",
-            [
-                ("Laboratorio Vecol", "3004567812"),
-                ("Laboratorios Erma", "3015678923"),
-                ("Laboratorio Calier", "3026789134"),
-                ("Elmplastic", "3037891245"),
-            ],
-        )
-
-    # Insertar clientes iniciales solo si la tabla está vacía
-    cursor.execute("SELECT COUNT(*) FROM clientes")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany(
-            "INSERT INTO clientes (nombre, telefono) VALUES (?, ?)",
-            [
-                ("Nutresa", "3104567821"),
-                ("Huevos KIKE", "3115678932"),
-                ("Cervalle", "3126789143"),
-                ("La Sevillana", "3137891254"),
-            ],
-        )
-
-    # Insertar productos iniciales solo si la tabla está vacía
-    cursor.execute("SELECT COUNT(*) FROM productos")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany(
-            """
-            INSERT INTO productos
-            (nombre, categoria, unidad_medida, precio_unitario, stock_minimo, fecha_vencimiento)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
-                ("Vecol Antibiótico 500 mg", "Antibiótico", "unidad", 18500, 10, "2027-06-30"),
-                ("Calier Vacuna Triple Felina", "Vacuna", "dosis", 32000, 15, "2027-03-15"),
-                ("Erma Desparasitante 10 ml", "Antiparasitario", "ml", 12500, 20, "2028-01-20"),
-                ("Miyagi Vitaminas Veterinarias 100 ml", "Vitaminas y suplementos", "ml", 24000, 12, "2027-09-10"),
-            ],
-        )
-
-    # Insertar movimientos iniciales solo si la tabla está vacía
-    cursor.execute("SELECT COUNT(*) FROM movimientos")
-    if cursor.fetchone()[0] == 0:
-        cursor.executemany(
-            """
-            INSERT INTO movimientos
-            (id_producto, tipo, cantidad, fecha, id_proveedor)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (1, "entrada", 50, "2026-09-01", 1),
-                (2, "entrada", 40, "2026-09-01", 3),
-                (3, "entrada", 60, "2026-09-02", 2),
-                (4, "entrada", 35, "2026-09-03", 4),
-            ],
-        )
-
-        cursor.executemany(
-            """
-            INSERT INTO movimientos
-            (id_producto, tipo, cantidad, fecha, id_cliente)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (1, "salida", 8, "2026-09-10", 1),
-                (2, "salida", 5, "2026-09-11", 2),
-                (3, "salida", 12, "2026-09-12", 3),
-                (4, "salida", 7, "2026-09-13", 4),
-            ],
-        )
-
-    # Crear la vista de inventario si no existe
-    cursor.execute(
-        """
-        CREATE VIEW IF NOT EXISTS vw_inventario AS
+        DROP VIEW IF EXISTS vw_inventario;
+        CREATE VIEW vw_inventario AS
         SELECT
             p.id_producto,
             p.nombre,
             p.categoria,
+            p.unidad_medida,
+            p.precio_unitario,
             p.stock_minimo,
+            p.fecha_vencimiento,
             COALESCE(
                 SUM(
                     CASE
@@ -155,376 +78,495 @@ def inicializar_base_datos(conexion):
                         WHEN m.tipo = 'salida' THEN -m.cantidad
                         ELSE 0
                     END
-                ), 0
+                ),
+                0
             ) AS stock
-        FROM productos AS p
-        LEFT JOIN movimientos AS m
-            ON m.id_producto = p.id_producto
+        FROM productos p
+        LEFT JOIN movimientos m ON p.id_producto = m.id_producto
         GROUP BY
             p.id_producto,
             p.nombre,
             p.categoria,
-            p.stock_minimo
+            p.unidad_medida,
+            p.precio_unitario,
+            p.stock_minimo,
+            p.fecha_vencimiento;
         """
     )
 
-    conexion.commit()
-
-
-def ver(sql, conexion):
-    """Ejecuta una consulta SQL y devuelve un DataFrame de pandas."""
-    return pd.read_sql_query(sql, conexion)
-
-
-def registrar_entrada(conexion, id_producto, cantidad, fecha=None, id_proveedor=None):
-    """Registra una entrada de inventario manteniendo la validación y lógica original."""
-    cursor = conexion.cursor()
-
-    if not isinstance(cantidad, int) or isinstance(cantidad, bool) or cantidad <= 0:
-        return False, "La cantidad debe ser un número entero mayor que cero."
-
-    cursor.execute(
-        "SELECT nombre FROM productos WHERE id_producto = ?",
-        (id_producto,),
-    )
-    producto = cursor.fetchone()
-
-    if producto is None:
-        return False, f"El producto con ID {id_producto} no existe."
-
-    fecha = fecha or date.today().isoformat()
-
-    try:
-        cursor.execute(
-            """
-            INSERT INTO movimientos
-                (id_producto, tipo, cantidad, fecha, id_proveedor)
-            VALUES (?, 'entrada', ?, ?, ?)
-            """,
-            (id_producto, cantidad, fecha, id_proveedor),
+    # Datos iniciales de ejemplo si la base está vacía
+    existe = cursor.execute("SELECT COUNT(*) FROM productos").fetchone()[0]
+    if existe == 0:
+        proveedores_ini = [
+            ("VetPharma Colombia", "3104567890", "Bogotá"),
+            ("BioAnimal Distribución", "3157891234", "Medellín"),
+            ("AgroSalud Veterinaria", "3209876543", "Cali"),
+        ]
+        cursor.executemany(
+            "INSERT INTO proveedores (nombre, telefono, ciudad) VALUES (?, ?, ?)",
+            proveedores_ini,
         )
-        conexion.commit()
-        return True, f"Entrada registrada: {cantidad} unidades de {producto[0]}."
-    except Exception as e:
-        conexion.rollback()
-        return False, f"Error al registrar la entrada: {e}"
 
-
-def registrar_salida(conexion, id_producto, cantidad, fecha=None, id_cliente=None):
-    """Registra una salida de inventario verificando stock disponible desde vw_inventario."""
-    cursor = conexion.cursor()
-
-    if not isinstance(cantidad, int) or isinstance(cantidad, bool) or cantidad <= 0:
-        return False, "La cantidad debe ser un número entero mayor que cero."
-
-    try:
-        cursor.execute(
-            """
-            SELECT nombre, stock
-            FROM vw_inventario
-            WHERE id_producto = ?
-            """,
-            (id_producto,),
+        clientes_ini = [
+            ("Nutresa", "6043214567", "Medellín"),
+            ("Huevos KIKE", "6024457890", "Cali"),
+            ("Cervalle", "6025568901", "Cali"),
+            ("La Sevillana", "3126789012", "Palmira"),
+        ]
+        cursor.executemany(
+            "INSERT INTO clientes (nombre, telefono, ciudad) VALUES (?, ?, ?)",
+            clientes_ini,
         )
-        producto = cursor.fetchone()
 
-        if producto is None:
-            return False, f"El producto con ID {id_producto} no existe."
-
-        nombre, stock_actual = producto
-
-        if cantidad > stock_actual:
-            return False, (
-                f"Stock insuficiente para {nombre}. "
-                f"Disponible: {stock_actual}; solicitado: {cantidad}."
-            )
-
-        fecha = fecha or date.today().isoformat()
-
-        cursor.execute(
-            """
-            INSERT INTO movimientos
-                (id_producto, tipo, cantidad, fecha, id_cliente)
-            VALUES (?, 'salida', ?, ?, ?)
-            """,
-            (id_producto, cantidad, fecha, id_cliente),
-        )
-        conexion.commit()
-        return True, f"Salida registrada: {cantidad} unidades de {nombre}."
-    except Exception as e:
-        conexion.rollback()
-        return False, f"Error al registrar la salida: {e}"
-
-
-def consultar_inventario(conexion, categoria=None):
-    """Consulta el inventario desde vw_inventario, opcionalmente filtrado por categoría."""
-    try:
-        if categoria is None:
-            consulta = """
-                SELECT id_producto, nombre, categoria, stock_minimo, stock
-                FROM vw_inventario
-                ORDER BY nombre
-            """
-            return ver(consulta, conexion)
-
-        consulta = """
-            SELECT id_producto, nombre, categoria, stock_minimo, stock
-            FROM vw_inventario
-            WHERE categoria = ?
-            ORDER BY nombre
-        """
-        return pd.read_sql_query(consulta, conexion, params=(categoria,))
-    except Exception as e:
-        st.error(f"Error al consultar el inventario: {e}")
-        return None
-
-
-def alertas_stock_bajo(conexion, minimo=30):
-    """Consulta los productos cuyo stock está por debajo del umbral indicado."""
-    if not isinstance(minimo, int) or isinstance(minimo, bool) or minimo < 0:
-        st.error("El mínimo debe ser un número entero mayor o igual a cero.")
-        return None
-
-    try:
-        consulta = """
-            SELECT id_producto, nombre, categoria, stock, stock_minimo
-            FROM vw_inventario
-            WHERE stock < ?
-            ORDER BY stock ASC
-        """
-        return pd.read_sql_query(consulta, conexion, params=(minimo,))
-    except Exception as e:
-        st.error(f"Error al consultar las alertas: {e}")
-        return None
-
-
-def agregar_producto(
-    conexion,
-    nombre,
-    categoria,
-    unidad_medida,
-    precio_unitario,
-    stock_minimo,
-    fecha_vencimiento=None,
-):
-    """Agrega un producto nuevo a la tabla productos tras validar sus campos."""
-    cursor = conexion.cursor()
-
-    if not all(
-        isinstance(valor, str) and valor.strip()
-        for valor in (nombre, categoria, unidad_medida)
-    ):
-        return False, "El nombre, la categoría y la unidad de medida son obligatorios."
-
-    if (
-        isinstance(precio_unitario, bool)
-        or not isinstance(precio_unitario, (int, float))
-        or precio_unitario <= 0
-    ):
-        return False, "El precio debe ser un número mayor que cero."
-
-    if (
-        not isinstance(stock_minimo, int)
-        or isinstance(stock_minimo, bool)
-        or stock_minimo < 0
-    ):
-        return False, "El stock mínimo debe ser un entero mayor o igual a cero."
-
-    try:
-        cursor.execute(
+        productos_ini = [
+            ("Ivermectina 1% 50ml", "Antiparasitarios", "frasco", 28500, 15, "2027-06-30"),
+            ("Amoxicilina Vet 250mg", "Antibióticos", "caja", 34000, 12, "2027-03-15"),
+            ("Vacuna Polivalente Canina", "Biológicos", "dosis", 42000, 20, "2026-12-31"),
+            ("Complejo B Inyectable 100ml", "Vitaminas y Suplementos", "frasco", 23000, 10, "2027-09-20"),
+            ("Meloxicam Oral 15ml", "Antiinflamatorios", "frasco", 19500, 10, "2027-05-10"),
+            ("Clorhexidina Spray 120ml", "Antisépticos", "frasco", 16000, 8, "2027-08-01"),
+        ]
+        cursor.executemany(
             """
             INSERT INTO productos
-                (nombre, categoria, unidad_medida,
-                 precio_unitario, stock_minimo, fecha_vencimiento)
+            (nombre, categoria, unidad_medida, precio_unitario, stock_minimo, fecha_vencimiento)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            productos_ini,
+        )
+
+        hoy = date.today().isoformat()
+        movimientos_ini = [
+            (1, 1, None, "entrada", 35, hoy, "Compra inicial lote A"),
+            (2, 1, None, "entrada", 25, hoy, "Reposición mensual"),
+            (3, 2, None, "entrada", 30, hoy, "Cadena de frío verificada"),
+            (4, 2, None, "entrada", 18, hoy, "Ingreso proveedor"),
+            (5, 3, None, "entrada", 14, hoy, "Ingreso inicial"),
+            (6, 3, None, "entrada", 20, hoy, "Ingreso inicial"),
+            (1, None, 1, "salida", 12, hoy, "Despacho pedido Nutresa"),
+            (3, None, 2, "salida", 16, hoy, "Entrega clínica Huevos KIKE"),
+            (5, None, 3, "salida", 8, hoy, "Pedido Cervalle"),
+        ]
+        cursor.executemany(
+            """
+            INSERT INTO movimientos
+            (id_producto, id_proveedor, id_cliente, tipo, cantidad, fecha, observacion)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            movimientos_ini,
+        )
+        conn.commit()
+
+
+# --- Funciones de negocio (SQLite) ---
+
+def obtener_productos(conn):
+    return pd.read_sql_query("SELECT * FROM vw_inventario ORDER BY nombre", conn)
+
+
+def obtener_proveedores(conn):
+    return pd.read_sql_query("SELECT * FROM proveedores ORDER BY nombre", conn)
+
+
+def obtener_clientes(conn):
+    return pd.read_sql_query("SELECT * FROM clientes ORDER BY nombre", conn)
+
+
+def obtener_historial_movimientos(conn):
+    query = """
+    SELECT
+        m.id_movimiento AS ID,
+        m.fecha AS Fecha,
+        UPPER(m.tipo) AS Tipo,
+        p.nombre AS Producto,
+        m.cantidad AS Cantidad,
+        COALESCE(pr.nombre, cl.nombre, '—') AS Tercero,
+        COALESCE(m.observacion, '') AS Observacion
+    FROM movimientos m
+    JOIN productos p ON m.id_producto = p.id_producto
+    LEFT JOIN proveedores pr ON m.id_proveedor = pr.id_proveedor
+    LEFT JOIN clientes cl ON m.id_cliente = cl.id_cliente
+    ORDER BY m.id_movimiento DESC
+    LIMIT 20
+    """
+    return pd.read_sql_query(query, conn)
+
+
+def agregar_proveedor(conn, nombre, telefono, ciudad):
+    nombre = nombre.strip()
+    if not nombre:
+        return False, "El nombre del proveedor es obligatorio."
+    try:
+        conn.execute(
+            "INSERT INTO proveedores (nombre, telefono, ciudad) VALUES (?, ?, ?)",
+            (nombre, telefono.strip(), ciudad.strip()),
+        )
+        conn.commit()
+        return True, f"Proveedor '{nombre}' registrado correctamente."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Error al guardar proveedor: {e}"
+
+
+def agregar_cliente(conn, nombre, telefono, ciudad):
+    nombre = nombre.strip()
+    if not nombre:
+        return False, "El nombre del cliente es obligatorio."
+    try:
+        conn.execute(
+            "INSERT INTO clientes (nombre, telefono, ciudad) VALUES (?, ?, ?)",
+            (nombre, telefono.strip(), ciudad.strip()),
+        )
+        conn.commit()
+        return True, f"Cliente '{nombre}' registrado correctamente."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Error al guardar cliente: {e}"
+
+
+def agregar_producto(conn, nombre, categoria, unidad_medida, precio_unitario, stock_minimo, fecha_vencimiento):
+    nombre = nombre.strip()
+    if not nombre:
+        return False, "El nombre del producto es obligatorio."
+    try:
+        conn.execute(
+            """
+            INSERT INTO productos
+            (nombre, categoria, unidad_medida, precio_unitario, stock_minimo, fecha_vencimiento)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                nombre.strip(),
+                nombre,
                 categoria.strip(),
                 unidad_medida.strip(),
-                precio_unitario,
-                stock_minimo,
-                fecha_vencimiento,
+                float(precio_unitario),
+                int(stock_minimo),
+                str(fecha_vencimiento),
             ),
         )
-        conexion.commit()
-        return True, f"Producto '{nombre.strip()}' registrado correctamente."
-    except Exception as e:
-        conexion.rollback()
-        return False, f"Error al registrar el producto: {e}"
+        conn.commit()
+        return True, f"Producto '{nombre}' agregado al catálogo."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Error al agregar producto: {e}"
 
 
-def registrar_entradas_lote(conexion, items, fecha=None):
-    """Registra varias entradas en una sola transacción; si falla una, revierte todas."""
-    cursor = conexion.cursor()
+def registrar_entrada(conn, id_producto, id_proveedor, cantidad, observacion=""):
+    if cantidad <= 0:
+        return False, "La cantidad debe ser mayor que cero."
+    try:
+        prod = conn.execute(
+            "SELECT nombre FROM productos WHERE id_producto = ?", (id_producto,)
+        ).fetchone()
+        prov = conn.execute(
+            "SELECT nombre FROM proveedores WHERE id_proveedor = ?", (id_proveedor,)
+        ).fetchone()
+        if not prod or not prov:
+            return False, "Producto o proveedor no válido."
 
-    if not items:
-        return False, "Debe proporcionar al menos una entrada."
-
-    for item in items:
-        if not isinstance(item, (tuple, list)) or len(item) != 2:
-            return False, "Cada entrada debe tener (id_producto, cantidad)."
-
-        id_producto, cantidad = item
-
-        if not isinstance(cantidad, int) or isinstance(cantidad, bool) or cantidad <= 0:
-            return False, "Todas las cantidades deben ser enteros mayores que cero."
-
-        cursor.execute(
-            "SELECT 1 FROM productos WHERE id_producto = ?",
-            (id_producto,),
+        conn.execute(
+            """
+            INSERT INTO movimientos (id_producto, id_proveedor, id_cliente, tipo, cantidad, fecha, observacion)
+            VALUES (?, ?, NULL, 'entrada', ?, ?, ?)
+            """,
+            (id_producto, id_proveedor, int(cantidad), date.today().isoformat(), observacion.strip()),
         )
-        if cursor.fetchone() is None:
+        conn.commit()
+        return True, f"Entrada registrada: +{cantidad} unid. de '{prod['nombre']}' (Proveedor: {prov['nombre']})."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Error en la base de datos: {e}"
+
+
+def registrar_salida(conn, id_producto, id_cliente, cantidad, observacion=""):
+    if cantidad <= 0:
+        return False, "La cantidad debe ser mayor que cero."
+    try:
+        fila = conn.execute(
+            "SELECT nombre, stock FROM vw_inventario WHERE id_producto = ?", (id_producto,)
+        ).fetchone()
+        cli = conn.execute(
+            "SELECT nombre FROM clientes WHERE id_cliente = ?", (id_cliente,)
+        ).fetchone()
+        if not fila or not cli:
+            return False, "Producto o cliente no válido."
+
+        stock_actual = int(fila["stock"])
+        if cantidad > stock_actual:
             return (
                 False,
-                f"El producto con ID {id_producto} no existe. No se registró ninguna entrada.",
+                f"Stock insuficiente para '{fila['nombre']}'. Disponible: {stock_actual}, solicitado: {cantidad}.",
             )
 
-    fecha = fecha or date.today().isoformat()
-
-    try:
-        for id_producto, cantidad in items:
-            cursor.execute(
-                """
-                INSERT INTO movimientos (id_producto, tipo, cantidad, fecha)
-                VALUES (?, 'entrada', ?, ?)
-                """,
-                (id_producto, cantidad, fecha),
-            )
-        conexion.commit()
-        return True, f"Se registraron correctamente {len(items)} entradas."
-    except Exception as e:
-        conexion.rollback()
-        return False, f"Error en el lote. Se cancelaron las entradas: {e}"
+        conn.execute(
+            """
+            INSERT INTO movimientos (id_producto, id_proveedor, id_cliente, tipo, cantidad, fecha, observacion)
+            VALUES (?, NULL, ?, 'salida', ?, ?, ?)
+            """,
+            (id_producto, id_cliente, int(cantidad), date.today().isoformat(), observacion.strip()),
+        )
+        conn.commit()
+        return True, f"Salida registrada: -{cantidad} unid. de '{fila['nombre']}' para cliente '{cli['nombre']}'."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Error en la base de datos: {e}"
 
 
-def renderizar_inicio(df_inventario):
-    """Muestra la pestaña Inicio con descripción y métricas generales."""
-    st.subheader("SIGA · MIYAGI ANIMALs")
-    st.write(
-        "Sistema de gestión de inventario para la farmacia veterinaria MIYAGI ANIMALs. "
-        "Permite controlar existencias, registrar movimientos de entrada y salida y monitorear alertas de stock."
-    )
-
-    total_productos = len(df_inventario)
-    unidades_en_stock = int(df_inventario["stock"].sum()) if not df_inventario.empty else 0
-    productos_bajo_minimo = (
-        int((df_inventario["stock"] < df_inventario["stock_minimo"]).sum())
-        if not df_inventario.empty
-        else 0
-    )
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Número de productos", total_productos)
-    col2.metric("Unidades en stock", unidades_en_stock)
-    col3.metric("Productos con stock bajo", productos_bajo_minimo)
-
-
-def renderizar_registrar_movimiento(conexion, df_inventario):
-    """Muestra el formulario para registrar entradas o salidas seleccionando producto por nombre."""
-    st.subheader("Registrar movimiento")
-
-    if df_inventario.empty:
-        st.warning("No hay productos registrados en el inventario.")
-        return
-
-    mapa_productos = dict(zip(df_inventario["nombre"], df_inventario["id_producto"]))
-    nombres_productos = list(mapa_productos.keys())
-
-    with st.form("form_movimiento"):
-        nombre_seleccionado = st.selectbox("Producto", options=nombres_productos)
-        tipo_movimiento = st.selectbox("Tipo de movimiento", options=["entrada", "salida"])
-        cantidad = st.number_input("Cantidad", min_value=1, step=1, value=1)
-        enviar = st.form_submit_button("Guardar movimiento")
-
-    if enviar:
-        id_producto = int(mapa_productos[nombre_seleccionado])
-        cantidad_entera = int(cantidad)
-
-        if tipo_movimiento == "entrada":
-            ok, mensaje = registrar_entrada(conexion, id_producto, cantidad_entera)
-        else:
-            ok, mensaje = registrar_salida(conexion, id_producto, cantidad_entera)
-
-        if ok:
-            st.success(mensaje)
-            st.rerun()
-        else:
-            st.error(mensaje)
-
-
-def renderizar_inventario(conexion, df_inventario):
-    """Muestra la tabla del inventario con filtro por categoría."""
-    st.subheader("Inventario actual")
-
-    if df_inventario.empty:
-        st.info("No hay datos de inventario para mostrar.")
-        return
-
-    categorias = ["Todas"] + sorted(df_inventario["categoria"].dropna().unique().tolist())
-    categoria_elegida = st.selectbox("Filtrar por categoría", options=categorias)
-
-    if categoria_elegida == "Todas":
-        df_filtrado = consultar_inventario(conexion)
-    else:
-        df_filtrado = consultar_inventario(conexion, categoria=categoria_elegida)
-
-    st.dataframe(df_filtrado, use_container_width=True)
-
-
-def renderizar_alertas(conexion, df_inventario):
-    """Muestra alertas de stock bajo según un umbral ajustable y un gráfico de barras."""
-    st.subheader("Alertas de stock bajo")
-
-    if df_inventario.empty:
-        st.info("No hay productos para evaluar alertas.")
-        return
-
-    max_stock = max(int(df_inventario["stock"].max()), 30)
-    umbral_minimo = st.slider(
-        "Selecciona el stock mínimo de referencia",
-        min_value=0,
-        max_value=max_stock,
-        value=30,
-        step=1,
-    )
-
-    df_alertas = alertas_stock_bajo(conexion, minimo=umbral_minimo)
-    st.dataframe(df_alertas, use_container_width=True)
-
-    if df_alertas is not None and not df_alertas.empty:
-        df_grafico = df_alertas.set_index("nombre")[["stock"]]
-        st.bar_chart(df_grafico)
-    else:
-        st.info("No hay productos por debajo del stock mínimo seleccionado.")
-
+# --- Interfaz Streamlit ---
 
 def main():
-    """Función principal de la aplicación Streamlit."""
-    conexion = obtener_conexion()
-    inicializar_base_datos(conexion)
+    conn = get_connection()
 
-    df_inventario = consultar_inventario(conexion)
-    if df_inventario is None:
-        df_inventario = pd.DataFrame(
-            columns=["id_producto", "nombre", "categoria", "stock_minimo", "stock"]
-        )
+    st.title("🐾 SIGA · MIYAGI ANIMALs")
+    st.caption("Sistema de Gestión de Inventario Veterinario · Entradas, Salidas, Stock y Alertas")
+    st.divider()
 
-    pestana_inicio, pestana_movimiento, pestana_inventario, pestana_alertas = st.tabs(
+    tab_inicio, tab_movimientos, tab_inventario, tab_alertas = st.tabs(
         ["Inicio", "Registrar movimiento", "Inventario", "Alertas"]
     )
 
-    with pestana_inicio:
-        renderizar_inicio(df_inventario)
+    # TAB 1: INICIO
+    with tab_inicio:
+        df_inv = obtener_productos(conn)
+        df_prov = obtener_proveedores(conn)
+        df_cli = obtener_clientes(conn)
 
-    with pestana_movimiento:
-        renderizar_registrar_movimiento(conexion, df_inventario)
+        total_productos = len(df_inv)
+        total_unidades = int(df_inv["stock"].sum()) if not df_inv.empty else 0
+        bajo_stock = int((df_inv["stock"] <= df_inv["stock_minimo"]).sum()) if not df_inv.empty else 0
+        valor_inventario = float((df_inv["stock"] * df_inv["precio_unitario"]).sum()) if not df_inv.empty else 0.0
 
-    with pestana_inventario:
-        renderizar_inventario(conexion, df_inventario)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            with st.container(border=True):
+                st.metric("Productos activos", total_productos)
+        with c2:
+            with st.container(border=True):
+                st.metric("Unidades en stock", total_unidades)
+        with c3:
+            with st.container(border=True):
+                st.metric("Alertas stock bajo", bajo_stock)
+        with c4:
+            with st.container(border=True):
+                st.metric("Valor estimado", f"${valor_inventario:,.0f}")
 
-    with pestana_alertas:
-        renderizar_alertas(conexion, df_inventario)
+        col_izq, col_der = st.columns([2, 1])
+        with col_izq:
+            with st.container(border=True):
+                st.subheader("Últimos movimientos registrados")
+                df_hist = obtener_historial_movimientos(conn)
+                st.dataframe(df_hist, use_container_width=True, hide_index=True)
+
+        with col_der:
+            with st.container(border=True):
+                st.subheader("Directorio activo")
+                st.write(f"**Proveedores registrados:** {len(df_prov)}")
+                st.dataframe(df_prov[["nombre", "ciudad"]], use_container_width=True, hide_index=True)
+                st.write(f"**Clientes registrados:** {len(df_cli)}")
+                st.dataframe(df_cli[["nombre", "ciudad"]], use_container_width=True, hide_index=True)
+
+    # TAB 2: REGISTRAR MOVIMIENTO (Entradas con Proveedor, Salidas con Cliente y Altas rápidas)
+    with tab_movimientos:
+        st.subheader("Gestión de Entradas, Salidas y Catálogo")
+
+        df_inv = obtener_productos(conn)
+        df_prov = obtener_proveedores(conn)
+        df_cli = obtener_clientes(conn)
+
+        mapa_productos = {
+            f"{row['nombre']} (Stock: {row['stock']} {row['unidad_medida']})": int(row["id_producto"])
+            for _, row in df_inv.iterrows()
+        }
+        mapa_proveedores = {
+            f"{row['nombre']} ({row['ciudad']})": int(row["id_proveedor"])
+            for _, row in df_prov.iterrows()
+        }
+        mapa_clientes = {
+            f"{row['nombre']} ({row['ciudad']})": int(row["id_cliente"])
+            for _, row in df_cli.iterrows()
+        }
+
+        col_ent, col_sal = st.columns(2)
+
+        # Bloque 1: Registrar ENTRADA con Proveedor
+        with col_ent:
+            with st.container(border=True):
+                st.markdown("### 📥 Registrar Entrada (Proveedor)")
+                st.caption("Ingresa mercancía al inventario asociando el proveedor que entrega.")
+                with st.form("form_entrada", clear_on_submit=True):
+                    prod_ent_label = st.selectbox("Producto", list(mapa_productos.keys()), key="sel_prod_ent")
+                    prov_label = st.selectbox("Proveedor", list(mapa_proveedores.keys()), key="sel_prov")
+                    cant_ent = st.number_input("Cantidad que ingresa", min_value=1, step=1, value=5, key="cant_ent")
+                    obs_ent = st.text_input("Observación / Lote (opcional)", key="obs_ent")
+                    sub_ent = st.form_submit_button("Guardar entrada", type="primary", use_container_width=True)
+
+                    if sub_ent:
+                        ok, msg = registrar_entrada(
+                            conn,
+                            mapa_productos[prod_ent_label],
+                            mapa_proveedores[prov_label],
+                            int(cant_ent),
+                            obs_ent,
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        # Bloque 2: Registrar SALIDA con Cliente
+        with col_sal:
+            with st.container(border=True):
+                st.markdown("### 📤 Registrar Salida (Cliente)")
+                st.caption("Despacha productos validando existencias y registrando el cliente que compra.")
+                with st.form("form_salida", clear_on_submit=True):
+                    prod_sal_label = st.selectbox("Producto", list(mapa_productos.keys()), key="sel_prod_sal")
+                    cli_label = st.selectbox("Cliente que compra", list(mapa_clientes.keys()), key="sel_cli")
+                    cant_sal = st.number_input("Cantidad que sale", min_value=1, step=1, value=2, key="cant_sal")
+                    obs_sal = st.text_input("Observación / Pedido (opcional)", key="obs_sal")
+                    sub_sal = st.form_submit_button("Guardar salida", type="primary", use_container_width=True)
+
+                    if sub_sal:
+                        ok, msg = registrar_salida(
+                            conn,
+                            mapa_productos[prod_sal_label],
+                            mapa_clientes[cli_label],
+                            int(cant_sal),
+                            obs_sal,
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        st.divider()
+        st.markdown("### ➕ Crear nuevo Proveedor, Producto o Cliente")
+        col_np, col_nprod, col_ncli = st.columns(3)
+
+        with col_np:
+            with st.container(border=True):
+                st.markdown("**Nuevo Proveedor**")
+                with st.form("form_nuevo_prov", clear_on_submit=True):
+                    p_nom = st.text_input("Nombre empresa / proveedor")
+                    p_tel = st.text_input("Teléfono")
+                    p_ciu = st.text_input("Ciudad", value="Cali")
+                    if st.form_submit_button("Agregar proveedor", use_container_width=True):
+                        ok, msg = agregar_proveedor(conn, p_nom, p_tel, p_ciu)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        with col_nprod:
+            with st.container(border=True):
+                st.markdown("**Nuevo Producto**")
+                with st.form("form_nuevo_prod", clear_on_submit=True):
+                    pr_nom = st.text_input("Nombre del producto")
+                    pr_cat = st.selectbox(
+                        "Categoría",
+                        [
+                            "Antiparasitarios",
+                            "Antibióticos",
+                            "Biológicos",
+                            "Vitaminas y Suplementos",
+                            "Antiinflamatorios",
+                            "Antisépticos",
+                        ],
+                    )
+                    pr_uni = st.selectbox("Unidad de medida", ["frasco", "caja", "dosis", "unidad", "sobre"])
+                    pr_pre = st.number_input("Precio unitario ($)", min_value=0, step=1000, value=20000)
+                    pr_min = st.number_input("Stock mínimo", min_value=1, step=1, value=10)
+                    pr_ven = st.date_input("Fecha de vencimiento", value=date(2027, 6, 30))
+                    if st.form_submit_button("Agregar producto", use_container_width=True):
+                        ok, msg = agregar_producto(conn, pr_nom, pr_cat, pr_uni, pr_pre, pr_min, pr_ven)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        with col_ncli:
+            with st.container(border=True):
+                st.markdown("**Nuevo Cliente**")
+                with st.form("form_nuevo_cli", clear_on_submit=True):
+                    c_nom = st.text_input("Nombre del cliente / clínica")
+                    c_tel = st.text_input("Teléfono contacto")
+                    c_ciu = st.text_input("Ciudad cliente", value="Cali")
+                    if st.form_submit_button("Agregar cliente", use_container_width=True):
+                        ok, msg = agregar_cliente(conn, c_nom, c_tel, c_ciu)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+    # TAB 3: INVENTARIO
+    with tab_inventario:
+        st.subheader("Inventario actual (calculado desde vw_inventario)")
+        df_inv = obtener_productos(conn)
+
+        categorias = ["Todas"] + sorted(df_inv["categoria"].unique().tolist())
+        cat_sel = st.selectbox("Filtrar por categoría", categorias)
+
+        if cat_sel != "Todas":
+            df_mostrar = df_inv[df_inv["categoria"] == cat_sel].copy()
+        else:
+            df_mostrar = df_inv.copy()
+
+        st.dataframe(
+            df_mostrar,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "id_producto": "ID",
+                "nombre": "Producto",
+                "categoria": "Categoría",
+                "unidad_medida": "Unidad",
+                "precio_unitario": st.column_config.NumberColumn("Precio Unit.", format="$%d"),
+                "stock_minimo": "Stock Mínimo",
+                "fecha_vencimiento": "Vencimiento",
+                "stock": "Stock Actual",
+            },
+        )
+
+    # TAB 4: ALERTAS
+    with tab_alertas:
+        st.subheader("Alertas de reposición y stock bajo")
+        df_inv = obtener_productos(conn)
+
+        umbral = st.slider(
+            "Mostrar productos con stock menor o igual a:",
+            min_value=1,
+            max_value=50,
+            value=15,
+        )
+
+        df_alertas = df_inv[df_inv["stock"] <= umbral].sort_values("stock")
+
+        if df_alertas.empty:
+            st.success(f"No hay productos con stock menor o igual a {umbral} unidades.")
+        else:
+            st.warning(f"Se encontraron {len(df_alertas)} producto(s) que requieren atención.")
+            col_t, col_g = st.columns([1.2, 1])
+            with col_t:
+                st.dataframe(
+                    df_alertas[["nombre", "categoria", "stock", "stock_minimo"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "nombre": "Producto",
+                        "categoria": "Categoría",
+                        "stock": "Stock Actual",
+                        "stock_minimo": "Mínimo Requerido",
+                    },
+                )
+            with col_g:
+                st.bar_chart(df_alertas.set_index("nombre")["stock"])
+
+    st.divider()
+    st.caption("SIGA · MIYAGI ANIMALs · Grupo 3 · Programación 2")
 
 
 if __name__ == "__main__":
